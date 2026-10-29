@@ -29,7 +29,8 @@
       <joint type="hinge" limited="true" damping="0" armature="0.02" frictionloss="0"/>
     </default>
     <default class="foot">
-      <geom friction="1.6 0.02 0.01" condim="4" priority="1" solref="0.008 1" solimp="0.9 0.95 0.001 0.5 2"/>
+      <!-- 第二项是扭转摩擦，单位是长度。0.08 m 相当于鞋底还有大约 8 cm 的力臂，点接触也能抗住竖直转动。 -->
+      <geom friction="1.6 0.08 0.01" condim="4" priority="1" solref="0.008 1" solimp="0.9 0.95 0.001 0.5 2"/>
     </default>
   </default>
 

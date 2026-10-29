@@ -22,10 +22,31 @@ PROJECTILE_RADIUS = 0.07
 PROJECTILE_SPEED = 22.0
 PROJECTILE_LIFETIME = 4.0
 PROJECTILE_SPAWN_OFFSET = 0.4
+# 查看器左键，也是 impact 课的 1 倍动量。5 倍只加质量，速度保持这一档，避免一步穿过身体。
+SHOT_MASS = 48.0
+SHOT_SPEED = 40.0
 
 FOOT_GEOM_NAMES = ("right_foot_geom", "left_foot_geom")
 FOOT_SITE_NAMES = ("right_foot_site", "left_foot_site")
-POSES = ("stand", "supine", "prone")
+# 会碰上地面或炮弹的部位。顺序就是观测里 pressure 的顺序。
+PRESSURE_SENSORS = (
+    "right_foot_geom",
+    "left_foot_geom",
+    "right_shin",
+    "left_shin",
+    "right_thigh",
+    "left_thigh",
+    "right_hand",
+    "left_hand",
+    "right_forearm",
+    "left_forearm",
+    "right_upper_arm",
+    "left_upper_arm",
+    "pelvis",
+    "chest",
+    "head",
+)
+POSES = ("stand", "supine", "prone", "random")
 
 
 @dataclass(frozen=True)
@@ -63,13 +84,25 @@ JOINTS: tuple[JointSpec, ...] = (
 
 DIAGNOSTIC_KEYS = (
     "base_height",
+    "chest_height",
+    "up_velocity",
     "upright",
     "fallen",
     "foot_contact",
+    "pressure",
     "foot_pos",
     "com",
     "base_lin_vel",
     "base_ang_vel",
+    "yaw_rate",
+    "body_pos_err",
+    "body_rot_err",
+    "body_align",
+    "body_height",
+    "foot_slip",
+    "joint_pos",
+    "joint_acc",
+    "torque",
     "projected_gravity",
     "hit_force",
     "pose",
@@ -87,8 +120,9 @@ def observation_slices(n_joints: int) -> dict[str, slice]:
         ("joint_pos", n_joints),
         ("joint_vel", n_joints),
         ("last_action", n_joints),
-        ("foot_contact", 2),
+        ("pressure", len(PRESSURE_SENSORS)),
         ("base_height", 1),
+        ("home", 4),
     )
     for name, size in fields:
         slices[name] = slice(cursor, cursor + size)
@@ -97,7 +131,7 @@ def observation_slices(n_joints: int) -> dict[str, slice]:
 
 
 def observation_size(n_joints: int) -> int:
-    return observation_slices(n_joints)["base_height"].stop
+    return observation_slices(n_joints)["home"].stop
 
 
 def describe_observation(n_joints: int | None = None) -> str:
@@ -106,6 +140,9 @@ def describe_observation(n_joints: int | None = None) -> str:
     for name, slc in observation_slices(n).items():
         lines.append(f"  [{slc.start:3d}:{slc.stop:<3d}]  {name}")
     lines.append("joint_pos 是相对站立姿态的角度（弧度）。")
-    lines.append("foot_contact 顺序是右脚、左脚，0 或 1。")
-    lines.append("projected_gravity 直立时约为 (0, 0, -1)。")
+    lines.append("pressure 是各部位法向接触力除以体重。顺序：")
+    lines.append("  " + ", ".join(PRESSURE_SENSORS))
+    lines.append("站稳时两只脚大约各 0.5。projected_gravity 直立时约为 (0, 0, -1)。")
+    lines.append("home 是零动作原点站姿：机体坐标下原点在前方、左方多远（米），以及朝向差的 sin、cos。")
+    lines.append("站在原点且朝向一致时 home 是 (0, 0, 0, 1)。")
     return "\n".join(lines)

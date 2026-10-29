@@ -6,3 +6,5 @@ __pycache__/
 .mujoco/
 build/
 dist/
+runs/
+MUJOCO_LOG.TXT

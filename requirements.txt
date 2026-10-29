@@ -1,3 +1,11 @@
+# 物理仿真
 mujoco>=3.3
 numpy>=1.26
 gymnasium>=0.29
+
+# 训练（GPU 版 torch 要走官方源）
+torch>=2.14 ; sys_platform != "win32"
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch>=2.14 ; sys_platform == "win32"
+stable-baselines3>=2.9
+swanlab[dashboard]>=0.10.2

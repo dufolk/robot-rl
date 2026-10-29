@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 import time
+from pathlib import Path
 
 import glfw
 import mujoco
@@ -14,6 +16,7 @@ import numpy as np
 
 from robot_rl.camera import FlyCamera
 from robot_rl.policy import Policy
+from robot_rl.robot import SHOT_MASS, SHOT_SPEED
 from robot_rl.sim import HumanoidSim
 
 _HELP = """两足人形 MuJoCo 平台
@@ -133,7 +136,7 @@ def _loop(window, context, sim: HumanoidSim, policy: Policy | None, seconds: flo
 
         if shot["pending"]:
             shot["pending"] = False
-            sim.spawn_projectile(fly.eye, fly.forward())
+            sim.spawn_projectile(fly.eye, fly.forward(), speed=SHOT_SPEED, mass=SHOT_MASS)
 
         if glfw.get_key(window, glfw.KEY_ESCAPE) == glfw.PRESS:
             glfw.set_window_should_close(window, True)
@@ -145,7 +148,12 @@ def _loop(window, context, sim: HumanoidSim, policy: Policy | None, seconds: flo
                 if sim.diverged:
                     sim.reset(sim.pose)
                 observation = sim.observation()
-                action = zeros if policy is None else np.asarray(policy.act(observation), dtype=np.float64)
+                if policy is None:
+                    action = zeros
+                elif isinstance(policy, _SavedPolicy) and policy.deepmimic:
+                    action = policy.act_sim(sim)
+                else:
+                    action = np.asarray(policy.act(observation), dtype=np.float64)
                 sim.apply_action(action)
             sim.physics_step()
             frame_hit = max(frame_hit, sim.last_hit_force)
@@ -216,8 +224,34 @@ def _overlay(viewport, context, sim: HumanoidSim, hit: float) -> None:
     )
 
 
+class _SavedPolicy:
+    def __init__(self, path: Path) -> None:
+        from stable_baselines3 import PPO
+
+        self._model = PPO.load(str(path), device="cpu")
+        shape = self._model.observation_space.shape
+        if shape not in ((89,), (157,), (189,), (245,)):
+            raise ValueError(f"不支持观测维度 {shape}。当前策略只接受身体状态；旧 160 维引导输入模型需要重新训练。")
+        self.deepmimic = shape != (89,)
+
+    def act_sim(self, sim: HumanoidSim) -> np.ndarray:
+        from robot_rl.motion import body_observation, fused_observation, physical_observation
+        size = self._model.observation_space.shape[0]
+        observation = physical_observation(sim) if size == 189 else fused_observation(sim) if size == 245 else body_observation(sim)
+        return self.act(observation)
+
+    def act(self, observation: np.ndarray) -> np.ndarray:
+        action, _state = self._model.predict(observation, deterministic=True)
+        return np.asarray(action, dtype=np.float64)
+
+
 def main() -> None:
-    run()
+    parser = argparse.ArgumentParser(description="打开查看器，可以加载一个训练好的策略")
+    parser.add_argument("--policy", type=Path, default=None, help="stable-baselines3 的 zip 检查点")
+    args = parser.parse_args()
+    if args.policy is not None:
+        print(f"加载策略 {args.policy}")
+    run(None if args.policy is None else _SavedPolicy(args.policy))
 
 
 if __name__ == "__main__":
