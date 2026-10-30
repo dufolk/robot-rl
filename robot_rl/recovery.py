@@ -1,4 +1,4 @@
-"""Strict recovery acquisition and holding, shared by getup-human and impact."""
+"""Strict recovery acquisition and holding, shared by getup and impact."""
 import numpy as np
 
 ACQUIRE_STEPS = 2 * 50

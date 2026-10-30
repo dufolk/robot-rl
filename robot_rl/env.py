@@ -1,13 +1,12 @@
-"""Gymnasium 环境。站立课用 `StandReward`，getup-plus 把发现奖励和站立奖励叠在一起。
+"""Gymnasium 课程环境。
 
-不选课程时，只有模拟发散或骨盆、胸口碰到地面才 `terminated`，超时是 `truncated`。
-选了课程之后，倒地超过 8 秒也按失败结束；站着走到时间上限算成功。
-getup-human 和 impact 使用参考动作奖励，严格恢复 2 秒再保持 3 秒；固定局长结束时只记评估成败，不加局末奖惩。
-impact 每局从站立开场打出一球，扛住球也可算评估成功。局末重置姿势。
+stand 使用站立奖励；getup 和 impact 默认使用本项目恢复奖励，可选轨迹精修。
+默认发现阶段没有参考时钟；可选精修阶段的时钟仅供奖励使用。
+两课的输入保留 189 维物理/动作/接触状态并追加三步真实历史，共 384 维。
+稳定两秒后继续保持三秒，固定局长结束时评估成败；躯干接地不提前结束起身。
+impact 每局站立开场发出一球，扛住也可成功。
 
-动作 [-1, 1]：0 保持 `robot.JOINTS` 里的站立角，±1 顶到关节限位。
-观测布局见 `robot.describe_observation()`。
-`curriculum` 见 `curriculum.CURRICULA`。查看器不选课程，也不自动发炮弹。
+动作 [-1, 1] 是 20 个关节的 PD 目标，0 对应模型的默认关节角。
 """
 
 from __future__ import annotations
@@ -18,14 +17,14 @@ from gymnasium import spaces
 
 from robot_rl.curriculum import Curriculum, get_curriculum
 from robot_rl.rewards import (
-    GetupPlusReward,
-    DeepMimicReward,
+    HumanUPReward,
+    GetupReward,
     TORSO_FORCE,
     StandReward,
     _is_standing,
 )
 from robot_rl.sim import HumanoidSim
-from robot_rl.motion import MotionClock, physical_observation, physical_observation_size, sample_reference, tracking_features
+from robot_rl.humanup import ObservationHistory, DiscoveryTrajectory, DiscoveryPoseCurriculum, GetupCurriculum, observation_size, PHYSICS_DT, ACTION_MAPPING
 from robot_rl.recovery import RecoveryGoal
 from robot_rl.strikes import Strike, StrikeSchedule, impact_ray
 
@@ -38,27 +37,46 @@ class HumanoidBalanceEnv(gym.Env):
         render_mode: str | None = None,
         max_episode_steps: int | None = None,
         curriculum: str | None = None,
+        humanup_stage: str = "discovery",
+        reference_path: str | None = None,
     ) -> None:
         super().__init__()
         if render_mode not in (None, "rgb_array"):
             raise ValueError("交互观看请运行 python -m robot_rl。这里的 render_mode 只用 rgb_array。")
+        explicit_horizon = max_episode_steps is not None
+        if humanup_stage not in ("discovery", "refinement"):
+            raise ValueError("humanup_stage must be discovery or refinement")
+        self.humanup_stage = humanup_stage
         self.render_mode = render_mode
         self.curriculum: Curriculum | None = None if curriculum is None else get_curriculum(curriculum)
         if max_episode_steps is None:
             max_episode_steps = 1000 if self.curriculum is None else self.curriculum.horizon
         self.max_episode_steps = None if max_episode_steps is None else int(max_episode_steps)
         self._recover_steps = None if self.curriculum is None else self.curriculum.recover_steps
-        self.sim = HumanoidSim()
+        self.sim = HumanoidSim(physics_dt=PHYSICS_DT if curriculum in ("getup", "impact") else None,
+                               action_mapping=ACTION_MAPPING if curriculum in ("getup", "impact") else "legacy")
         profile = None if self.curriculum is None else self.curriculum.strikes
         self._schedule = None if profile is None else StrikeSchedule(profile)
         self._progress = 0.0
-        self._human_recovery = self.curriculum is not None and self.curriculum.name in ("getup-human", "impact")
+        self._human_recovery = self.curriculum is not None and self.curriculum.name in ("getup", "impact")
         self._recovery = RecoveryGoal()
-        self._motion = MotionClock()
+        self._history = ObservationHistory()
+        self._pose_curriculum = GetupCurriculum() if humanup_stage == "discovery" else DiscoveryPoseCurriculum()
+        self._trajectory = DiscoveryTrajectory(reference_path) if self._human_recovery and humanup_stage == "refinement" else None
+        if self._trajectory is not None and not explicit_horizon:
+            duration = max(self._trajectory.duration(p) for p in ("prone", "supine"))
+            self.max_episode_steps = max(self.max_episode_steps, int(np.ceil((duration + 5.1) * self.sim.control_hz)))
+        self._tracking_time = 0.
+        self._tracking_pose = "supine"
+        self._tracking_active = False
+        import mujoco
+        self._head_id = mujoco.mj_name2id(self.sim.model, mujoco.mjtObj.mjOBJ_GEOM, "head")
+        self._stand_base_height = float(self.sim.data.xpos[self.sim.pelvis_id, 2])
+        self._stand_head_height = float(self.sim.data.geom_xpos[self._head_id, 2])
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(physical_observation_size(self.sim) if self._human_recovery else self.sim.obs_size,),
+            shape=(observation_size(self.sim) if self._human_recovery else self.sim.obs_size,),
             dtype=np.float32,
         )
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.sim.n_act,), dtype=np.float32)
@@ -74,9 +92,8 @@ class HumanoidBalanceEnv(gym.Env):
         self._assist_fraction = 0.0
         self._assist_n = 0.0
         if self._human_recovery:
-            self._reward = DeepMimicReward(self.sim.weight)
-        elif self.curriculum is not None and self.curriculum.name == "getup-plus":
-            self._reward = GetupPlusReward(self.sim.weight)
+            self._reward = (GetupReward(self.sim.weight, control_dt=1. / self.sim.control_hz) if humanup_stage == "discovery"
+                            else HumanUPReward(self.sim.weight, humanup_stage, self._trajectory, control_dt=1. / self.sim.control_hz))
         else:
             self._reward = StandReward(self.sim.weight)
 
@@ -110,6 +127,8 @@ class HumanoidBalanceEnv(gym.Env):
             self._down_steps = 0
             self._steps = 0
             self._reward.reset()
+            if self._human_recovery:
+                self._history.reset(self.sim)
             observation = self._observation()
             info = self._info(0.0, self.sim.foot_contact)
             info["feet_now"] = info["foot_contact"]
@@ -122,28 +141,25 @@ class HumanoidBalanceEnv(gym.Env):
         self._stable_steps = 0
         self._shots = 0
         self._shot = None
+        self._explicit_pose = bool(options and "pose" in options)
         pose = self._sample_pose()
         if options and "pose" in options:
             pose = options["pose"]
         self.sim.reset(pose, self.np_random if pose == "random" else None)
         if self._human_recovery:
-            impact = self.curriculum.name == "impact"
-            clip = pose if pose in ("prone", "supine") else "prone"
-            self._motion.reset(clip)
-            if impact or pose == "stand":
-                self._motion.time = self._motion.duration
-                self._motion.recovering = False
-            elif pose == "random":
-                self._motion.recovering = False
-                self._motion.observe_fall(self.sim)
-            # Uniform reference-state initialization during training. Explicit
-            # pose resets used by fixed evaluation always start at clip time 0.
-            if self.curriculum.name == "getup-human" and not options:
-                self._motion.reset(str(self.np_random.choice(("prone", "supine"))))
-                self._motion.time = float(self.np_random.uniform(0., self._motion.duration))
-                self._set_reference_state()
-            elif not impact and pose in ("prone", "supine"):
-                self._set_reference_state()
+            self._tracking_pose = pose if pose in ("prone", "supine") else "supine"
+            self._tracking_time = 0.
+            self._tracking_active = pose in ("prone", "supine", "random")
+            if self._trajectory is not None and pose == "stand":
+                self._tracking_time = self._trajectory.duration(self._tracking_pose)
+            # Stage II perturbs initial joint configurations; no mocap reset.
+            if self._trajectory is not None and pose in ("prone", "supine") and not options:
+                import mujoco
+                q = self.sim.data.qpos[self.sim.qpos_adr] + self.np_random.uniform(-.15, .15, self.sim.n_act)
+                self.sim.data.qpos[self.sim.qpos_adr] = np.clip(q, self.sim.q_low, self.sim.q_high)
+                mujoco.mj_forward(self.sim.model, self.sim.data)
+                self.sim._plant_on_ground()
+            self._history.reset(self.sim)
         self._reward.reset()
         self._down_steps = 0
         if self._schedule is not None:
@@ -155,10 +171,21 @@ class HumanoidBalanceEnv(gym.Env):
         info = self._info(0.0, self.sim.foot_contact)
         info["feet_now"] = info["foot_contact"]
         info["strike"] = self._shot
+        if isinstance(self._reward, (HumanUPReward, GetupReward)):
+            self._reward.prime(info)
         return observation, info
 
     def step(self, action):
-        self.sim.set_assist(self._assist_n)
+        if self._human_recovery and self.humanup_stage == "discovery":
+            # Taper to zero before standing. Final five seconds are always
+            # unassisted, and explicitly requested test poses never get help.
+            height = float(self.sim.data.xpos[self.sim.pelvis_id, 2])
+            fade = float(np.clip((.75 * self._stand_base_height - height) / (.6 * self._stand_base_height), 0., 1.))
+            allowed = (self.curriculum.name == "getup" and not self._explicit_pose
+                       and self.sim.pose != "stand" and self.max_episode_steps is not None
+                       and self._steps < self.max_episode_steps - 250)
+            self.assist_fraction = self._pose_curriculum.assistance * fade if allowed else 0.
+        self.sim.set_assist(self._assist_n, upright_only=not isinstance(self._reward, GetupReward))
         self.sim.apply_action(np.asarray(action, dtype=np.float64))
         strike = self._maybe_strike()
         peak_hit = 0.0
@@ -170,13 +197,24 @@ class HumanoidBalanceEnv(gym.Env):
             if self.sim.diverged:
                 break
         if self._human_recovery:
-            self._motion.advance(1. / self.sim.control_hz)
-            if self.curriculum.name == "impact":
-                self._motion.observe_fall(self.sim)
+            self._history.advance(self.sim)
+            if self._trajectory is not None:
+                state = self.sim.control_state()
+                fallen = state["base_height"] < .6 or state["upright"] < .5
+                if self.curriculum.name == "impact" and fallen and not self._tracking_active:
+                    forward_z = self.sim.data.xmat[self.sim.pelvis_id].reshape(3, 3)[2, 0]
+                    self._tracking_pose = "supine" if forward_z > 0. else "prone"
+                    self._tracking_time, self._tracking_active = 0., True
+                else:
+                    self._tracking_time += 1. / self.sim.control_hz
+                if not fallen and self._tracking_time >= self._trajectory.duration(self._tracking_pose):
+                    self._tracking_active = False
         observation = self._observation()
         info = self._info(peak_hit, feet)
         info["feet_now"] = (bool(self.sim.foot_contact[0]), bool(self.sim.foot_contact[1]))
         info["strike"] = _strike_record(strike)
+        if self._human_recovery:
+            info["reward_failure"] = bool(self.sim.diverged or not np.isfinite(observation).all())
         reward, terms = self._reward.update(np.asarray(action, dtype=np.float32), info)
         terms["assist"] = float(self._assist_n / self.sim.weight)
         info["reward_terms"] = terms
@@ -192,25 +230,20 @@ class HumanoidBalanceEnv(gym.Env):
             self.curriculum is None or self.curriculum.end_on_torso
         )
         terminated = bool(self.sim.diverged or torso or not np.isfinite(observation).all())
-        # Ground contact is expected during get-up. Only apply the paper's
-        # torso-contact termination once the reference has reached standing.
-        # Impact keeps its recovery window; it must allow a fall after a hit.
-        if (self._human_recovery and self.curriculum.name == "getup-human"
-                and self._motion.phase >= 1. and info["torso_floor_n"] > TORSO_FORCE):
-            terminated = True
         impact = self.curriculum is not None and self.curriculum.name == "impact"
         if impact and not terminated:
             self._update_impact(info)
         elif self._human_recovery and not terminated:
-            self._recovery.update(info)
+            self._recovery.update(info, eligible=self._assist_n == 0.)
         if self._human_recovery:
             info["recovery_stage"] = self._recovery.stage
             info["recovery_stable_steps"] = self._recovery.stable_steps
             info["is_recovered"] = self._recovery.complete
             if timed_out and not terminated:
-                # 固定局长结束。成败只记 is_success，不加局末奖惩。
-                terminated = True
-                info["is_success"] = self._recovery.complete
+                # A fixed collection horizon is a timeout, not an absorbing
+                # failure. SB3 must bootstrap V(terminal_observation), as in
+                # upstream HumanUP time_outs handling. Success is separate.
+                info["is_success"] = bool(self._recovery.complete and self._assist_n == 0.)
         truncated = bool(timed_out and self._recover_steps is None and not terminated)
         if self._recover_steps is not None and not terminated and (recover_failed or timed_out):
             truncated = True
@@ -222,6 +255,14 @@ class HumanoidBalanceEnv(gym.Env):
                 info["is_success"] = False
             if self._human_recovery and "is_success" not in info:
                 info["is_success"] = False
+        if self._human_recovery:
+            info["prone_probability"] = self._pose_curriculum.prone_probability
+            info["assist_fraction"] = self._assist_fraction
+            info["assistance_level"] = getattr(self._pose_curriculum, "level", 3)
+            if terminated or truncated:
+                self._reward.end_episode(info["base_height"], info["stand_base_height"])
+                if not self._explicit_pose and self.curriculum.name == "getup" and self.humanup_stage == "discovery":
+                    self._pose_curriculum.update(self.sim.pose, info.get("is_success", False))
         return observation, reward, terminated, truncated, info
 
     def fire_projectile(self, origin, direction, speed: float | None = None) -> bool:
@@ -254,25 +295,16 @@ class HumanoidBalanceEnv(gym.Env):
     def _sample_pose(self) -> str:
         if self.curriculum is None:
             return "stand"
+        if self.curriculum.name == "getup" and self.humanup_stage == "discovery":
+            return self._pose_curriculum.sample(self.np_random)
         names = [name for name, _weight in self.curriculum.poses]
         weights = [weight for _name, weight in self.curriculum.poses]
         return str(self.np_random.choice(names, p=weights))
 
     def _observation(self):
         if self._human_recovery:
-            return physical_observation(self.sim)
+            return self._history.observation(self.sim)
         return self.sim.observation()
-
-    def _set_reference_state(self):
-        import mujoco
-        target = sample_reference(self._motion.clip, self._motion.time)
-        root, dof = self.sim.root_qpos_adr, self.sim.root_dof_adr
-        self.sim.data.qpos[root:root + 7] = target["qpos"][:7]
-        self.sim.data.qpos[self.sim.qpos_adr] = target["q"]
-        self.sim.data.qvel[dof:dof + 6] = target["qvel"][:6]
-        self.sim.data.qvel[self.sim.dof_adr] = target["qvel"][6:]
-        self.sim.q_target[:] = target["q"]
-        mujoco.mj_forward(self.sim.model, self.sim.data)
 
     def _fire_impact_ball(self) -> None:
         if self.curriculum is None or self.curriculum.strikes is None:
@@ -333,13 +365,40 @@ class HumanoidBalanceEnv(gym.Env):
         info["hit_force"] = float(hit_force)
         info["foot_contact"] = (bool(feet[0]), bool(feet[1]))
         if self._human_recovery:
-            info["reference_clip"] = self._motion.clip
-            info["reference_time"] = self._motion.time
-            info["reference_phase"] = self._motion.phase
             info["chest_upright"] = float(self.sim.data.geom_xmat[self.sim.chest_geom_id].reshape(3, 3)[2, 2])
-            info["motion_features"] = tracking_features(self.sim)
+            info["head_height"] = float(self.sim.data.geom_xpos[self._head_id, 2])
+            info["stand_base_height"] = self._stand_base_height
+            info["stand_head_height"] = self._stand_head_height
+            feet = self.sim.data.xpos[self.sim.foot_body_ids]
+            info["feet_height"] = feet[:, 2].copy()
+            info["feet_distance"] = float(np.linalg.norm(feet[0, :2] - feet[1, :2]))
+            matrices = self.sim.data.xmat[self.sim.foot_body_ids].reshape(-1, 3, 3)
+            info["feet_tilt"] = float(np.linalg.norm(matrices[:, 2, :2], axis=1).sum())
             info["joint_q"] = self.sim.data.qpos[self.sim.qpos_adr].copy()
             info["joint_velocity"] = self.sim.data.qvel[self.sim.dof_adr].copy()
+            mid = (self.sim.q_low + self.sim.q_high) / 2.
+            half = (self.sim.q_high - self.sim.q_low) * .95 / 2.
+            info["joint_limit_excess"] = np.maximum(mid - half - info["joint_q"], 0.) + np.maximum(info["joint_q"] - mid - half, 0.)
+            info["torque_limit_excess"] = np.maximum(np.abs(info["torque"]) / self.sim.torque_limit - .95, 0.)
+            # Reward-only measurements at the final control-step state, matching
+            # upstream net rigid-body contacts rather than peak floor sensors.
+            import mujoco
+            force = np.zeros((2, 3))
+            contact_force = np.zeros(6)
+            for index in range(self.sim.data.ncon):
+                contact = self.sim.data.contact[index]
+                bodies = self.sim.model.geom_bodyid[[contact.geom1, contact.geom2]]
+                if not any(body in self.sim.foot_body_ids for body in bodies):
+                    continue
+                mujoco.mj_contactForce(self.sim.model, self.sim.data, index, contact_force)
+                world_force = contact.frame.reshape(3, 3).T @ contact_force[:3]
+                for side, body in enumerate(self.sim.foot_body_ids):
+                    force[side] += world_force * (int(bodies[1] == body) - int(bodies[0] == body))
+            info["feet_force"] = force
+            info["feet_speed"] = np.array([self.sim._horizontal_speed(int(body)) for body in self.sim.foot_body_ids])
+            if self._trajectory is not None:
+                info["tracking_pose"] = self._tracking_pose
+                info["tracking_time"] = self._tracking_time
         return info
 
 

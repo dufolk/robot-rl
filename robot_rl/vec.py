@@ -21,8 +21,12 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv, VecEnvIndices, VecEnvObs, VecEnvStepReturn
 
 from robot_rl.env import HumanoidBalanceEnv
+from robot_rl.rewards import regularization_scale
 
 N_ENVS = 256
+TRAIN_INFO_KEYS = frozenset(("reward_terms", "motion_match", "prone_probability",
+    "regularization_strength", "recovery_stage", "recovery_stable_steps", "is_recovered",
+    "is_success", "episode", "TimeLimit.truncated", "terminal_observation", "diverged", "termination_height", "assist_fraction", "assistance_level"))
 
 
 def worker_count(n_envs: int) -> int:
@@ -31,7 +35,7 @@ def worker_count(n_envs: int) -> int:
 
 
 class ShardedVecEnv(VecEnv):
-    def __init__(self, n_envs: int, curriculum: str, seed: int = 0, n_workers: int | None = None) -> None:
+    def __init__(self, n_envs: int, curriculum: str, seed: int = 0, n_workers: int | None = None, env_kwargs: dict | None = None, compact_infos: bool = False) -> None:
         if n_envs < 1:
             raise ValueError(f"环境数至少为 1，收到 {n_envs}")
         self._n_workers = worker_count(n_envs) if n_workers is None else int(n_workers)
@@ -54,7 +58,7 @@ class ShardedVecEnv(VecEnv):
             parent, child = ctx.Pipe()
             process = ctx.Process(
                 target=_serve,
-                args=(child, count, curriculum, seed + rank),
+                args=(child, count, curriculum, seed + rank, env_kwargs or {}, compact_infos),
                 daemon=True,
             )
             process.start()
@@ -66,11 +70,15 @@ class ShardedVecEnv(VecEnv):
         observation_space, action_space = self._call(0, ("spec", None))
         super().__init__(n_envs, observation_space, action_space)
         self._waiting = False
+        self._humanup = curriculum in ("getup", "impact") and (env_kwargs or {}).get("humanup_stage") == "refinement"
+        self._regularization_strength = 1.
+        self._termination_heights = np.zeros(n_envs)
 
     def step_async(self, actions: np.ndarray) -> None:
         actions = np.asarray(actions)
         for remote, offset, count in zip(self._remotes, self._offsets, self._counts):
-            remote.send(("step", actions[offset : offset + count]))
+            batch = actions[offset : offset + count]
+            remote.send(("step", (batch, self._regularization_strength) if self._humanup else batch))
         self._waiting = True
 
     def step_wait(self) -> VecEnvStepReturn:
@@ -84,6 +92,12 @@ class ShardedVecEnv(VecEnv):
         infos: list[dict] = []
         for batch in batches:
             infos.extend(batch[3])
+        if self._humanup:
+            for index, (done, info) in enumerate(zip(dones, infos)):
+                if done:
+                    self._termination_heights[index] = info["termination_height"]
+            self._regularization_strength = regularization_scale(
+                self._regularization_strength, float(self._termination_heights.mean()))
         return observations, rewards, dones, infos
 
     def reset(self) -> VecEnvObs:
@@ -184,11 +198,11 @@ class ShardedVecEnv(VecEnv):
         return message
 
 
-def _serve(conn: Connection, n_local: int, curriculum: str, seed: int) -> None:
+def _serve(conn: Connection, n_local: int, curriculum: str, seed: int, env_kwargs: dict | None = None, compact_infos: bool = False) -> None:
     try:
         envs = []
         for rank in range(n_local):
-            env = HumanoidBalanceEnv(curriculum=curriculum)
+            env = HumanoidBalanceEnv(curriculum=curriculum, **(env_kwargs or {}))
             env.action_space.seed(seed + rank)
             env = Monitor(env, info_keywords=("is_success",))
             envs.append(env)
@@ -197,7 +211,12 @@ def _serve(conn: Connection, n_local: int, curriculum: str, seed: int) -> None:
             if command == "spec":
                 conn.send((envs[0].observation_space, envs[0].action_space))
             elif command == "step":
-                conn.send(_step_all(envs, payload))
+                if isinstance(payload, tuple):
+                    payload, strength = payload
+                    for env in envs:
+                        env.unwrapped._reward.adapt_regularization = False
+                        env.unwrapped._reward.regularization_strength = strength
+                conn.send(_step_all(envs, payload, compact_infos=compact_infos))
             elif command == "reset":
                 conn.send(_reset_all(envs, payload, seed))
             elif command == "get_attr":
@@ -235,7 +254,7 @@ def _serve(conn: Connection, n_local: int, curriculum: str, seed: int) -> None:
         conn.close()
 
 
-def _step_all(envs: list, actions: np.ndarray) -> tuple:
+def _step_all(envs: list, actions: np.ndarray, compact_infos: bool = False) -> tuple:
     observations = []
     rewards = np.zeros(len(envs), dtype=np.float32)
     dones = np.zeros(len(envs), dtype=bool)
@@ -246,12 +265,14 @@ def _step_all(envs: list, actions: np.ndarray) -> tuple:
         info = dict(info)
         info["TimeLimit.truncated"] = bool(truncated and not terminated)
         if done:
+            if "base_height" in info:
+                info["termination_height"] = float(info["base_height"])
             info["terminal_observation"] = obs
             obs, _reset_info = env.reset()
         observations.append(np.asarray(obs, dtype=np.float32))
         rewards[index] = float(reward)
         dones[index] = done
-        infos.append(info)
+        infos.append({key: value for key, value in info.items() if key in TRAIN_INFO_KEYS} if compact_infos else info)
     return np.stack(observations), rewards, dones, infos
 
 

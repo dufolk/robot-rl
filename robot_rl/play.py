@@ -47,7 +47,8 @@ def _configure_stdio() -> None:
 def run(policy: Policy | None = None, *, seconds: float | None = None) -> None:
     _configure_stdio()
     print(_HELP, flush=True)
-    sim = HumanoidSim()
+    sim = HumanoidSim(physics_dt=getattr(policy, "physics_dt", None),
+                      action_mapping=getattr(policy, "action_mapping", "legacy"))
     if not glfw.init():
         raise RuntimeError("GLFW 初始化失败，无法打开查看器")
     window = None
@@ -150,7 +151,7 @@ def _loop(window, context, sim: HumanoidSim, policy: Policy | None, seconds: flo
                 observation = sim.observation()
                 if policy is None:
                     action = zeros
-                elif isinstance(policy, _SavedPolicy) and policy.deepmimic:
+                elif isinstance(policy, _SavedPolicy) and policy.uses_body_observation:
                     action = policy.act_sim(sim)
                 else:
                     action = np.asarray(policy.act(observation), dtype=np.float64)
@@ -226,18 +227,46 @@ def _overlay(viewport, context, sim: HumanoidSim, hit: float) -> None:
 
 class _SavedPolicy:
     def __init__(self, path: Path) -> None:
-        from stable_baselines3 import PPO
+        from robot_rl.checkpoint import InferencePolicy
 
-        self._model = PPO.load(str(path), device="cpu")
+        self._model = InferencePolicy(path)
         shape = self._model.observation_space.shape
-        if shape not in ((89,), (157,), (189,), (245,)):
+        if shape not in ((89,), (157,), (189,), (245,), (384,), (839,)):
             raise ValueError(f"不支持观测维度 {shape}。当前策略只接受身体状态；旧 160 维引导输入模型需要重新训练。")
-        self.deepmimic = shape != (89,)
+        self.uses_body_observation = shape != (89,)
+        self.physics_dt = None
+        self.action_mapping = "legacy"
+        self._history = None
+        self._last_time = None
+        if shape in ((384,), (839,)):
+            from robot_rl.humanup import ObservationHistory, SCALED_CONTRACTS, PHYSICS_DT, MODEL_CONTRACT, ACTION_MAPPING, JOINT_LIMIT_CONTRACTS
+            contract = getattr(self._model, "humanup_contract", None)
+            if contract is not None and contract not in SCALED_CONTRACTS:
+                raise ValueError(f"Unsupported HumanUP observation contract: {contract}")
+            if (shape == (384,)) != (contract == MODEL_CONTRACT):
+                raise ValueError("Checkpoint history length does not match its observation contract")
+            self._history = ObservationHistory(normalized=contract in SCALED_CONTRACTS,
+                                                steps=(shape[0] - 189) // 65)
+            self.physics_dt = PHYSICS_DT if contract in SCALED_CONTRACTS else None
+            self.action_mapping = ACTION_MAPPING if contract in JOINT_LIMIT_CONTRACTS else "legacy"
 
     def act_sim(self, sim: HumanoidSim) -> np.ndarray:
         from robot_rl.motion import body_observation, fused_observation, physical_observation
         size = self._model.observation_space.shape[0]
-        observation = physical_observation(sim) if size == 189 else fused_observation(sim) if size == 245 else body_observation(sim)
+        if self._history is not None:
+            now = float(sim.data.time)
+            if self._last_time is None or now <= self._last_time:
+                self._history.reset(sim)
+            else:
+                self._history.advance(sim)
+            self._last_time = now
+            observation = self._history.observation(sim)
+        elif size == 189:
+            observation = physical_observation(sim)
+        elif size == 245:
+            observation = fused_observation(sim)
+        else:
+            observation = body_observation(sim)
         return self.act(observation)
 
     def act(self, observation: np.ndarray) -> np.ndarray:

@@ -1,23 +1,10 @@
-"""Body-only policy observations; DeepMimic-style references are reward-only.
+"""Shared physical observations; no task clock or reference data is read.
 
-This deliberately omits the original paper's policy phase / skill conditioning.
+Legacy body/fused layouts remain for viewing old checkpoints. The active policy
+layout is physical_observation; HumanUP appends real observation history.
 """
-from functools import lru_cache
-from pathlib import Path
 import numpy as np
 import mujoco
-
-REFERENCE_PATH = Path(__file__).parent / "assets/motions/getup_deepmimic.npz"
-CLIPS = ("prone", "supine")
-
-
-@lru_cache(maxsize=1)
-def reference_library() -> dict[str, np.ndarray]:
-    with np.load(REFERENCE_PATH, allow_pickle=False) as archive:
-        clips = {key: archive[key].copy() for key in archive.files}
-    for values in clips.values():
-        values.flags.writeable = False
-    return clips
 
 
 def heading_basis(sim):
@@ -104,82 +91,3 @@ def tracking_features(sim) -> np.ndarray:
     root_quat = np.empty(4)
     mujoco.mju_mat2Quat(root_quat, (basis.T @ sim.data.xmat[sim.pelvis_id].reshape(3, 3)).ravel())
     return np.r_[ee.ravel(), com, root_quat]
-
-
-def sample_reference(clip: str, time: float) -> dict[str, np.ndarray]:
-    bank = reference_library()
-    times = bank[f"{clip}_time"]
-    time = float(np.clip(time, 0., times[-1]))
-    right = min(int(np.searchsorted(times, time, side="right")), len(times) - 1)
-    left = max(0, right - 1)
-    alpha = 0. if right == left else (time - times[left]) / (times[right] - times[left])
-    result = {}
-    for key in ("q", "velocity", "features", "qpos", "qvel"):
-        values = bank[f"{clip}_{key}"]
-        a, b = values[left].astype(float), values[right].astype(float).copy()
-        if key == "qpos" and np.dot(a[3:7], b[3:7]) < 0.:
-            b[3:7] *= -1.
-        result[key] = (1. - alpha) * a + alpha * b
-    result["qpos"][3:7] /= np.linalg.norm(result["qpos"][3:7])
-    # Quaternion sign is arbitrary, including across adjacent source frames.
-    qa = bank[f"{clip}_features"][left, 15:19]
-    qb = bank[f"{clip}_features"][right, 15:19]
-    if np.dot(qa, qb) < 0.:
-        qb = -qb
-    quat = (1. - alpha) * qa + alpha * qb
-    result["features"][15:19] = quat / np.linalg.norm(quat)
-    if time >= times[-1]:
-        result["velocity"][:] = 0.
-        result["qvel"][:] = 0.
-    return result
-
-
-def match_reference(joint_q, joint_velocity, features, *, clip: str, time: float) -> dict[str, float]:
-    """Paper's weights/kernels; hinge differences replace quaternion differences.
-
-    EE/COM use a common heading frame rather than global XY coordinates.
-    Only the prescribed clip and timestamp can receive reward.
-    """
-    target = sample_reference(clip, time)
-    dot = abs(float(np.dot(target["features"][15:19], features[15:19])))
-    root_angle = 2. * np.arccos(np.clip(dot, 0., 1.))
-    pose = np.exp(-2. * (np.sum(np.square(target["q"] - joint_q)) + root_angle ** 2))
-    velocity = np.exp(-.1 * np.sum(np.square(target["velocity"] - joint_velocity)))
-    ee = np.exp(-40. * np.sum(np.square(target["features"][:12] - features[:12])))
-    com = np.exp(-10. * np.sum(np.square(target["features"][12:15] - features[12:15])))
-    return {"imitation": float(.65 * pose + .1 * velocity + .15 * ee + .1 * com),
-            "reference_pose": float(pose), "reference_velocity": float(velocity),
-            "reference_ee": float(ee), "reference_com": float(com)}
-
-
-class MotionClock:
-    def __init__(self):
-        self.clip = "prone"
-        self.time = 0.
-        self.recovering = False
-
-    @property
-    def duration(self):
-        return float(reference_library()[f"{self.clip}_time"][-1])
-
-    @property
-    def phase(self):
-        return min(self.time / self.duration, 1.)
-
-    def reset(self, clip="prone", time=0., recovering=True):
-        if clip not in CLIPS:
-            raise ValueError(f"Unknown motion clip: {clip}")
-        self.clip, self.time, self.recovering = clip, float(time), recovering
-
-    def advance(self, dt):
-        self.time = min(self.time + dt, self.duration)
-
-    def observe_fall(self, sim):
-        """Select one recovery clip on a fall; never search frames for reward."""
-        state = sim.control_state()
-        fallen = state["base_height"] < .6 or state["upright"] < .5
-        if fallen and not self.recovering:
-            forward_z = sim.data.xmat[sim.pelvis_id].reshape(3, 3)[2, 0]
-            self.reset("supine" if forward_z > 0. else "prone")
-        elif self.phase == 1. and state["base_height"] > .8 and state["upright"] > .9:
-            self.recovering = False

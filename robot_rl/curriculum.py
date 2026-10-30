@@ -1,10 +1,4 @@
-"""用 `--curriculum` 选择独立课程。
-
-1. stand：不发炮弹，只站稳。站立奖励。
-2. getup-plus：一成站着，四成趴着，四成仰躺，一成任意姿态。发现奖励叠上站立奖励。
-3. getup-human：DeepMimic 相位跟踪模仿，严格恢复与保持，固定 20 秒。
-4. impact：单发球从轻到重，允许扛住；同样精修动作，固定 30 秒后检查严格保持。
-"""
+"""独立课程：stand 站立；getup HumanUP 两阶段起身；impact 单球恢复。"""
 
 from __future__ import annotations
 
@@ -46,15 +40,6 @@ class Curriculum:
     end_on_torso: bool = True
 
 
-# 爬起和 getup-plus 共用。任意姿态在仿真里有一半会从空中落下。
-GETUP_POSES: tuple[tuple[str, float], ...] = (
-    ("stand", 0.10),
-    ("prone", 0.40),
-    ("supine", 0.40),
-    ("random", 0.10),
-)
-
-
 CURRICULA: dict[str, Curriculum] = {
     "stand": Curriculum(
         name="stand",
@@ -63,26 +48,18 @@ CURRICULA: dict[str, Curriculum] = {
         poses=(("stand", 1.0),),
         strikes=None,
     ),
-    "getup-plus": Curriculum(
-        name="getup-plus",
-        description="一成站着，四成趴着，四成仰躺，一成任意姿态。发现奖励再叠站立奖励。倒地 8 秒才失败",
-        horizon=750,
-        poses=GETUP_POSES,
-        strikes=None,
-        end_on_torso=False,
-    ),
-    "getup-human": Curriculum(
-        name="getup-human",
-        description="DeepMimic 相位跟踪模仿，随机参考状态初始化；严格站稳 2 秒再保持 3 秒，整局 20 秒",
+    "getup": Curriculum(
+        name="getup",
+        description="自主起身与静止保持，成功驱动撤除训练辅助",
         horizon=20 * 50,
-        poses=GETUP_POSES,
+        poses=(("stand", .1), ("prone", .45), ("supine", .45)),
         strikes=None,
         recover_steps=None,
         end_on_torso=False,
     ),
     "impact": Curriculum(
         name="impact",
-        description="站立开场单发球，允许直接扛住；DeepMimic 相位跟踪奖励，严格恢复并保持，30 秒结束",
+        description="站立开场单发球，允许直接扛住；恢复与静止保持奖励，严格恢复并保持，30 秒结束",
         horizon=IMPACT_STEPS,
         poses=(("stand", 1.0),),
         strikes=StrikeProfile(

@@ -364,79 +364,8 @@ def test_reward_events():
     assert terms["ang_vel"] == 0.0
 
 
-def test_getup_reward_prefers_standing_over_lying():
-    from robot_rl.rewards import GetupReward
-
-    reward = GetupReward(400.0)
-    standing = _reward_state(
-        base_height=0.95,
-        chest_height=1.2,
-        projected_gravity=np.array([0.0, 0.0, -1.0]),
-        joint_pos=np.ones(4),
-        floor_n=_floor(right_foot_geom=200.0, left_foot_geom=200.0),
-    )
-    lying = _reward_state(
-        base_height=0.2,
-        chest_height=0.14,
-        projected_gravity=np.array([0.0, 0.0, 1.0]),
-        foot_contact=(False, False),
-        upright=0.0,
-        floor_n=_floor(pelvis=80.0),
-        joint_pos=np.ones(4),
-    )
-    kneeling = _reward_state(
-        base_height=0.55,
-        chest_height=0.66,
-        projected_gravity=np.array([0.0, 0.0, -1.0]),
-        upright=0.97,
-        foot_contact=(False, False),
-        floor_n=_floor(right_shin=80.0, left_shin=80.0),
-    )
-    stand_total, stand_terms = reward.update(np.zeros(4), standing)
-    reward.reset()
-    lie_total, lie_terms = reward.update(np.zeros(4), lying)
-    reward.reset()
-    kneel_total, kneel_terms = reward.update(np.zeros(4), kneeling)
-    assert stand_terms["height"] > lie_terms["height"]
-    assert stand_terms["upright"] > lie_terms["upright"]
-    assert math.isclose(stand_terms["feet"], 1.5)
-    assert kneel_terms["feet"] == 0.0
-    assert "lin_vel" not in stand_terms
-    assert "undesired" not in kneel_terms
-    assert stand_total > lie_total
-    reward.reset()
-    reward.update(np.zeros(4), _reward_state(base_height=0.2))
-    _, rising = reward.update(np.zeros(4), _reward_state(base_height=0.24))
-    assert rising["d_height"] > 0.0
-
-
-def test_getup_plus_penalizes_sliding_while_keeping_getup_terms():
-    from robot_rl.rewards import FEET_SLIDE, GetupPlusReward
-
-    reward = GetupPlusReward(400.0)
-    feet = _floor(right_foot_geom=200.0, left_foot_geom=200.0)
-    still = _reward_state(base_height=0.95, floor_n=feet)
-    sliding = _reward_state(
-        base_height=0.95,
-        base_lin_vel=np.array([0.9, 0.0, 0.0]),
-        foot_slip=1.7,
-        floor_n=feet,
-    )
-    _, still_terms = reward.update(np.zeros(4), still)
-    reward.reset()
-    _, slide_terms = reward.update(np.zeros(4), sliding)
-    assert math.isclose(still_terms["height"], slide_terms["height"])
-    assert math.isclose(still_terms["feet"], 1.5)
-    assert still_terms["lin_vel"] > slide_terms["lin_vel"]
-    assert math.isclose(slide_terms["feet_slide"], FEET_SLIDE * 1.7)
-    assert still_terms["total"] > slide_terms["total"]
-    env = HumanoidBalanceEnv(curriculum="getup-plus")
-    assert type(env._reward).__name__ == "GetupPlusReward"
-    env.close()
-
-
 def test_getup_starts_without_assist():
-    env = HumanoidBalanceEnv(curriculum="getup-plus")
+    env = HumanoidBalanceEnv(curriculum="getup")
     assert env._assist_n == 0.0
     env.close()
 
@@ -506,7 +435,7 @@ def test_launch_from_below_lifts_the_robot():
 
 def test_impact_fires_one_knockdown_ball_per_episode():
     from robot_rl.curriculum import IMPACT_STEPS, get_curriculum
-    from robot_rl.rewards import DeepMimicReward
+    from robot_rl.rewards import GetupReward
     from robot_rl.robot import SHOT_MASS, SHOT_SPEED
     from robot_rl.strikes import STRIKE_STABLE_STEPS
 
@@ -522,7 +451,7 @@ def test_impact_fires_one_knockdown_ball_per_episode():
     assert course.strikes.speed_cap == SHOT_SPEED
 
     env = HumanoidBalanceEnv(curriculum="impact")
-    assert isinstance(env._reward, DeepMimicReward)
+    assert isinstance(env._reward, GetupReward)
     momenta = []
     for seed in range(12):
         _, info = env.reset(seed=seed)
@@ -574,8 +503,8 @@ def test_impact_fires_one_knockdown_ball_per_episode():
         if step < 30:
             assert not terminated
             assert not truncated
-    assert terminated
-    assert not truncated
+    assert not terminated
+    assert truncated
     assert info["is_success"] is False
     assert "outcome" not in info["reward_terms"]
     assert reward == pytest.approx(info["reward_terms"]["total"])
@@ -600,8 +529,8 @@ def test_impact_fires_one_knockdown_ball_per_episode():
     assert not succeeded._knocked_down
     assert info["is_recovered"]
     _, reward, terminated, truncated, info = succeeded.step(np.zeros(succeeded.action_space.shape))
-    assert terminated
-    assert not truncated
+    assert not terminated
+    assert truncated
     assert info["is_success"] is True
     assert "outcome" not in info["reward_terms"]
     assert reward == pytest.approx(info["reward_terms"]["total"])
@@ -640,23 +569,6 @@ def test_mean_policy_kl_is_zero_for_identical_policies_and_grows_when_means_diff
         assert mean_policy_kl(model.policy, reference, obs) > 0.1
     finally:
         env.close()
-
-
-def test_getup_human_reopens_action_noise_to_init():
-    import math
-    import torch
-    from types import SimpleNamespace
-    from robot_rl.train import GETUP_HUMAN_LOG_STD, LOG_STD_INIT, _reopen_action_noise
-
-    assert GETUP_HUMAN_LOG_STD == LOG_STD_INIT
-    log_std = torch.nn.Parameter(torch.full((20,), -3.0))
-    opt = torch.optim.Adam([log_std], lr=1e-4)
-    opt.step()
-    model = SimpleNamespace(policy=SimpleNamespace(log_std=log_std, optimizer=opt))
-    before, after = _reopen_action_noise(model, GETUP_HUMAN_LOG_STD)
-    assert before == pytest.approx(math.exp(-3.0))
-    assert after == pytest.approx(math.exp(LOG_STD_INIT), rel=1e-5)
-    assert float(log_std.mean()) == pytest.approx(LOG_STD_INIT)
 
 
 def test_logged_metric_names_are_chinese():
@@ -732,23 +644,10 @@ def test_curriculum_progress_uses_only_new_training_steps():
 def test_remaining_courses():
     from robot_rl.curriculum import CURRICULA, get_curriculum
 
-    assert list(CURRICULA) == [
-        "stand",
-        "getup-plus",
-        "getup-human",
-        "impact",
-    ]
+    assert list(CURRICULA) == ["stand", "getup", "impact"]
     assert get_curriculum("stand").strikes is None
     assert get_curriculum("stand").end_on_torso
-    assert get_curriculum("getup-plus").poses == (
-        ("stand", 0.10),
-        ("prone", 0.40),
-        ("supine", 0.40),
-        ("random", 0.10),
-    )
-    assert not get_curriculum("getup-plus").end_on_torso
-    assert get_curriculum("getup-plus").strikes is None
-    human = get_curriculum("getup-human")
+    human = get_curriculum("getup")
     assert human.horizon == 1000
     assert human.strikes is None
     assert human.recover_steps is None
@@ -790,31 +689,29 @@ def test_curriculum_success_and_getup_plus():
     assert info["is_success"] is False
     fallen.close()
 
-    getup = HumanoidBalanceEnv(curriculum="getup-plus", max_episode_steps=RECOVER_STEPS + 50)
-    assert type(getup._reward).__name__ == "GetupPlusReward"
+    getup = HumanoidBalanceEnv(curriculum="getup", max_episode_steps=RECOVER_STEPS + 50)
+    assert type(getup._reward).__name__ == "GetupReward"
     poses = []
     for seed in range(100):
         getup.reset(seed=seed)
         poses.append(getup.sim.pose)
         if getup.sim.pose != "random":
             assert abs(getup.sim.lowest_point_z() - FOOT_CLEARANCE) < 1e-3
-    assert set(poses) == {"stand", "prone", "supine", "random"}
-    assert 1 <= poses.count("stand") <= 25
-    assert 20 <= poses.count("prone") <= 60
-    assert 20 <= poses.count("supine") <= 60
-    assert 1 <= poses.count("random") <= 25
+    assert set(poses) == {"stand", "supine"}
+    assert 15 <= poses.count("stand") <= 45
+    assert poses.count("prone") == 0
+    assert 55 <= poses.count("supine") <= 85
     getup.reset(seed=0, options={"pose": "supine"})
     info = {}
     terminated = False
     truncated = False
-    for _ in range(RECOVER_STEPS):
+    for _ in range(RECOVER_STEPS + 50):
         _, _, terminated, truncated, info = getup.step(np.zeros(getup.action_space.shape))
-        assert not terminated
-        if truncated:
+        if terminated or truncated:
             break
-    assert truncated
+    assert not terminated and truncated
     assert info["is_success"] is False
-    assert "height" in info["reward_terms"]
+    assert "height_deficit" in info["reward_terms"]
     getup.reset(seed=0, options={"pose": "stand"})
     getup.sim.set_assist(120.0)
     getup.sim.physics_step()
@@ -828,22 +725,13 @@ def test_curriculum_success_and_getup_plus():
 
 def test_success_stop_needs_a_full_perfect_window():
     from robot_rl.curriculum import SUCCESS_WINDOW
-    from robot_rl.train import GETUP_SUCCESS_RATE, ready_to_stop, success_threshold
-
+    from robot_rl.train import ready_to_stop, success_threshold
     assert not ready_to_stop([True] * 20)
     assert ready_to_stop([True] * SUCCESS_WINDOW)
-    almost = [True] * (SUCCESS_WINDOW - 1) + [False]
-    assert not ready_to_stop(almost)
-    assert success_threshold("stand") > success_threshold("getup-plus")
+    assert not ready_to_stop([True] * (SUCCESS_WINDOW - 1) + [False])
+    assert success_threshold("stand") is not None
+    assert success_threshold("getup") is None
     assert success_threshold("impact") is None
-    assert success_threshold("getup-human") is None
-    getup = [True] * int(SUCCESS_WINDOW * GETUP_SUCCESS_RATE) + [False] * (SUCCESS_WINDOW - int(SUCCESS_WINDOW * GETUP_SUCCESS_RATE))
-    assert len(getup) == SUCCESS_WINDOW
-    assert not ready_to_stop(getup, threshold=success_threshold("stand"))
-    assert ready_to_stop([True] * SUCCESS_WINDOW, threshold=success_threshold("getup-plus"))
-    # 97% 要严格超过这条线。刚好 9700/10000 不算。
-    assert sum(getup) / SUCCESS_WINDOW == GETUP_SUCCESS_RATE
-    assert not ready_to_stop(getup, threshold=success_threshold("getup-plus"))
 
 
 def test_prune_checkpoints_keeps_the_latest_per_course(tmp_path):
@@ -881,7 +769,7 @@ def test_prune_checkpoints_keeps_the_latest_per_course(tmp_path):
     ]
 
 
-@pytest.mark.parametrize("curriculum", ["stand", "getup-human"])
+@pytest.mark.parametrize("curriculum", ["stand", "getup"])
 def test_sharded_vec_steps_several_humanoids(curriculum):
     from robot_rl.vec import ShardedVecEnv
 

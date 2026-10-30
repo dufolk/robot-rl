@@ -115,8 +115,15 @@ class HumanoidSim:
     真正的平衡和爬起要改关节目标，不能靠把这层 PD 再加硬。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, physics_dt: float | None = None, action_mapping: str = "legacy") -> None:
+        if action_mapping not in ("legacy", "joint_limits"):
+            raise ValueError("action_mapping must be legacy or joint_limits")
+        self.action_mapping = action_mapping
         self.model = load_model()
+        if physics_dt is not None:
+            if not math.isfinite(physics_dt) or physics_dt <= 0.:
+                raise ValueError("physics_dt must be positive and finite")
+            self.model.opt.timestep = float(physics_dt)
         self.data = mujoco.MjData(self.model)
         self.sim_dt = float(self.model.opt.timestep)
         self.control_hz = CONTROL_HZ
@@ -152,6 +159,7 @@ class HumanoidSim:
             raise ValueError("站立姿态超出关节限位")
         span_low = self.default_q - self.q_low
         span_high = self.q_high - self.default_q
+        self.action_scale_low, self.action_scale_high = span_low, span_high
         self.action_scale = np.maximum(span_low, span_high)
 
         root_id = _require_id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "root")
@@ -183,6 +191,8 @@ class HumanoidSim:
         )
         self._pressure_index = {int(geom_id): index for index, geom_id in enumerate(self.pressure_geom_ids)}
         self._robot_geoms = self._collect_robot_geoms()
+        self._robot_geom_set = frozenset(map(int, self._robot_geoms))
+        self._foot_side = {int(gid): side for side, gid in enumerate(self.foot_geom_ids)}
         missing = [name for name in self._colliding_geom_names() if name not in PRESSURE_SENSORS]
         if missing:
             raise RuntimeError(f"这些碰撞体没有压力传感器：{missing}")
@@ -191,6 +201,7 @@ class HumanoidSim:
             raise RuntimeError("体重应该是正的")
         self.weight = weight
         self._balls = self._collect_balls()
+        self._park_cache_state = None
         self.robot_body_ids = self._collect_robot_bodies()
         self.robot_body_names = [
             mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, int(body_id)) for body_id in self.robot_body_ids
@@ -273,8 +284,14 @@ class HumanoidSim:
         self.floor_n[:] = 0.0
         self.foot_slip = 0.0
         self.last_action[:] = command
-        target = self.default_q + command * self.action_scale
-        self.q_target[:] = np.clip(target, self.q_low, self.q_high)
+        self.q_target[:] = self.action_targets(command)
+
+    def action_targets(self, action):
+        """Map normalized targets; new policies use each side's actual range."""
+        command = np.clip(np.asarray(action), -1., 1.)
+        scale = (np.where(command >= 0., self.action_scale_high, self.action_scale_low)
+                 if self.action_mapping == "joint_limits" else self.action_scale)
+        return np.clip(self.default_q + command * scale, self.q_low, self.q_high)
 
     def spawn_projectile(
         self,
@@ -299,9 +316,10 @@ class HumanoidSim:
         mujoco.mj_forward(self.model, self.data)
         return True
 
-    def set_assist(self, newtons: float) -> None:
+    def set_assist(self, newtons: float, upright_only: bool = True) -> None:
         """爬起时加在骨盆上的向上拉力。躯干没立起来就不施力。"""
         self._assist_n = max(0.0, float(newtons))
+        self._assist_upright_only = upright_only
 
     def physics_step(self) -> None:
         if self.diverged:
@@ -466,7 +484,7 @@ class HumanoidSim:
         if self._assist_n <= 0.0:
             return
         upright = -float(self._projected_gravity()[2])
-        if upright < 0.7:
+        if upright < 0.7 and getattr(self, "_assist_upright_only", True):
             return
         self.data.xfrc_applied[self.pelvis_id, 2] = self._assist_n
 
@@ -516,21 +534,21 @@ class HumanoidSim:
         sensed = np.zeros(len(PRESSURE_SENSORS), dtype=np.float64)
         hit = 0.0
         balls = {ball.geom_id: ball for ball in self._balls if ball.active}
-        robot_geoms = set(int(geom_id) for geom_id in self._robot_geoms)
-        foot_ids = [int(gid) for gid in self.foot_geom_ids]
+        robot_geoms = self._robot_geom_set
         struck = []
         for index in range(self.data.ncon):
             contact = self.data.contact[index]
             pair = (int(contact.geom1), int(contact.geom2))
-            pair_set = set(pair)
-            if self.floor_geom in pair_set:
-                for side, geom_id in enumerate(foot_ids):
-                    if geom_id in pair_set:
-                        feet[side] = True
-                        self.foot_slip = max(self.foot_slip, self._horizontal_speed(int(self.foot_body_ids[side])))
-            sensed_here = [self._pressure_index[geom_id] for geom_id in pair if geom_id in self._pressure_index]
-            ball = next((balls[geom_id] for geom_id in pair if geom_id in balls), None)
-            on_body = bool(pair_set & robot_geoms)
+            on_floor = self.floor_geom in pair
+            if on_floor:
+                geom_id = pair[1] if pair[0] == self.floor_geom else pair[0]
+                side = self._foot_side.get(geom_id)
+                if side is not None and not feet[side]:
+                    feet[side] = True
+                    self.foot_slip = max(self.foot_slip, self._horizontal_speed(int(self.foot_body_ids[side])))
+            sensed_here = [slot for geom_id in pair if (slot := self._pressure_index.get(geom_id)) is not None]
+            ball = balls.get(pair[0]) or balls.get(pair[1])
+            on_body = pair[0] in robot_geoms or pair[1] in robot_geoms
             if not sensed_here and not (ball is not None and on_body):
                 continue
             mujoco.mj_contactForce(self.model, self.data, index, self._contact_force)
@@ -538,7 +556,7 @@ class HumanoidSim:
             normal = newtons / self.weight
             for slot in sensed_here:
                 sensed[slot] += normal
-            if self.floor_geom in pair_set:
+            if on_floor:
                 for geom_id in pair:
                     slot = self._pressure_index.get(geom_id)
                     if slot is not None:
@@ -660,9 +678,15 @@ class HumanoidSim:
         self.data.qvel[ball.dof_adr : ball.dof_adr + 6] = 0.0
 
     def _pin_inactive(self) -> None:
-        for ball in self._balls:
-            if not ball.active:
-                self._write_park(ball)
+        state = tuple(ball.active for ball in self._balls)
+        if state != self._park_cache_state:
+            inactive = [ball for ball in self._balls if not ball.active]
+            self._park_qpos = np.array([ball.qpos_adr + i for ball in inactive for i in range(7)], dtype=int)
+            self._park_values = np.array([value for ball in inactive for value in (*ball.park, *_QUAT_IDENTITY)])
+            self._park_qvel = np.array([ball.dof_adr + i for ball in inactive for i in range(6)], dtype=int)
+            self._park_cache_state = state
+        self.data.qpos[self._park_qpos] = self._park_values
+        self.data.qvel[self._park_qvel] = 0.
 
     def _retire_projectiles(self) -> None:
         now = float(self.data.time)
