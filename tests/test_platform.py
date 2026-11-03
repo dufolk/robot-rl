@@ -697,10 +697,11 @@ def test_curriculum_success_and_getup_plus():
         poses.append(getup.sim.pose)
         if getup.sim.pose != "random":
             assert abs(getup.sim.lowest_point_z() - FOOT_CLEARANCE) < 1e-3
-    assert set(poses) == {"stand", "supine"}
-    assert 15 <= poses.count("stand") <= 45
-    assert poses.count("prone") == 0
-    assert 55 <= poses.count("supine") <= 85
+    # Prone and random starts are mixed in from the first episode.
+    assert set(poses) == {"stand", "supine", "prone", "random"}
+    assert 2 <= poses.count("stand") <= 25
+    assert 15 <= poses.count("prone") <= 45
+    assert 20 <= poses.count("supine") <= 50
     getup.reset(seed=0, options={"pose": "supine"})
     info = {}
     terminated = False

@@ -26,10 +26,14 @@ from robot_rl.rewards import regularization_scale
 N_ENVS = 256
 TRAIN_INFO_KEYS = frozenset(("reward_terms", "motion_match", "prone_probability",
     "regularization_strength", "recovery_stage", "recovery_stable_steps", "is_recovered",
-    "is_success", "episode", "TimeLimit.truncated", "terminal_observation", "diverged", "termination_height", "assist_fraction", "assistance_level"))
+    "is_success", "episode", "TimeLimit.truncated", "terminal_observation", "diverged", "termination_height", "assist_fraction", "assistance_level",
+    "reached_upright"))
 
 
 def worker_count(n_envs: int) -> int:
+    override = os.environ.get("ROBOT_RL_WORKERS")
+    if override:
+        return max(1, min(int(n_envs), int(override)))
     cores = os.cpu_count() or 8
     return max(1, min(int(n_envs), max(1, cores - 4)))
 

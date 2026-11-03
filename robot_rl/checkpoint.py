@@ -49,9 +49,10 @@ class InferencePolicy:
         self.observation_space = data["observation_space"]
         self.action_space = data["action_space"]
         self.humanup_contract = data["humanup_contract"]
-        self.recovery_actions = data["policy_class"] is RecoveryPolicy
+        self.recovery_actions = (isinstance(data["policy_class"], type)
+                                 and issubclass(data["policy_class"], RecoveryPolicy))
         self.latent_mean_limit = LATENT_MEAN_LIMIT
-        if (data["policy_class"] not in (ActorCriticPolicy, RecoveryPolicy)
+        if ((data["policy_class"] not in (ActorCriticPolicy, RecoveryPolicy) and not self.recovery_actions)
                 or kwargs.get("features_extractor_class", FlattenExtractor) is not FlattenExtractor
                 or len(self.observation_space.shape) != 1
                 or len(self.action_space.shape) != 1):
@@ -77,7 +78,9 @@ class InferencePolicy:
             layer.load_state_dict({"weight": weight, "bias": bias}, strict=True)
             layers.append(layer)
             if prefix != "action_net":
-                layers.append(activation())
+                activations = kwargs.get("actor_activations")
+                layer_activation = activations[len(layers) // 2] if activations else activation
+                layers.append(layer_activation())
             input_dim = weight.shape[0]
         if input_dim != self.action_space.shape[0]:
             raise ValueError("Actor output does not match the action space")

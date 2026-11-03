@@ -17,9 +17,14 @@ import math
 import numpy as np
 
 from robot_rl.robot import FALL_UPRIGHT
+from robot_rl.recovery import is_recovered
 
 
 CHEST_UP_HEIGHT = 0.8
+# Joint groups for the standing-posture term (indices into robot.JOINTS).
+POSTURE_TRUNK = np.array([0, 1, 2, 3, 8, 9])   # waist, hip yaw and roll
+POSTURE_ARMS = np.arange(14, 20)               # shoulders and elbows
+STAND_FEET_DISTANCE = .34
 STABLE_LIN = 0.45
 STABLE_ANG = 1.2
 
@@ -87,15 +92,28 @@ class GetupReward(StandReward):
         self._previous_potential = None
 
     def geometry(self, info):
-        height = float(np.clip((info["base_height"] - .15) / max(info["stand_base_height"] - .15, .1), 0., 1.))
-        upright = float(np.clip(min(info["upright"], info["chest_upright"]), 0., 1.))
+        base = float(np.clip((info["base_height"] - .15) / max(info["stand_base_height"] - .15, .1), 0., 1.))
+        head = float(np.clip((info["head_height"] - .1) / max(info["stand_head_height"] - .1, .1), 0., 1.))
+        # Signed orientation distinguishes lying, upside-down and upright.
+        # Pelvis height alone must never make a headstand look like standing.
+        signed_up = float(np.clip(min(info["upright"], info["chest_upright"]), -1., 1.))
+        upright = .5 * (signed_up + 1.)
+        quality = min(base, head) * max(signed_up, 0.)
         feet = np.asarray(info["floor_n"])[:2]
-        load = float(np.clip(np.sum(feet) / self.weight, 0., 1.))
-        potential = 4. * height * (.25 + .75 * upright) + upright
-        return height, upright, load, potential
+        # Balanced loading is continuous: one loaded foot cannot masquerade as
+        # two-foot support and a 2 N threshold is not the sole learning signal.
+        load = float(np.clip(2. * min(feet) / self.weight, 0., 1.))
+        potential = 4. * quality + upright
+        return quality, upright, load, potential
 
     def prime(self, info):
         self._previous_potential = self.geometry(info)[3]
+
+    @staticmethod
+    def posture(info):
+        q = np.asarray(info["joint_pos"])
+        error = 2. * float(np.mean(q[POSTURE_TRUNK] ** 2)) + float(np.mean(q[POSTURE_ARMS] ** 2))
+        return float(np.exp(-error / .15))
 
     def end_episode(self, height, stand_height):
         pass
@@ -106,29 +124,34 @@ class GetupReward(StandReward):
             # not: SB3 bootstraps it as a continuation of the physical task.
             value = -10. - (self._previous_potential or 0.)
             return value, {"termination": value, "total": value}
-        from robot_rl.recovery import is_recovered
         height, upright, load, potential = self.geometry(info)
         previous = potential if self._previous_potential is None else self._previous_potential
         command = np.asarray(action)
         last = command if self._previous_action is None else self._previous_action
-        near_stand = float(np.clip((height - .65) / .3, 0., 1.)) * upright ** 2
-        support = float(np.all(np.asarray(info["floor_n"])[:2] > 2.))
         nonfoot = float(np.sum(np.asarray(info["floor_n"])[2:]) / self.weight)
         linear = float(np.sum(np.asarray(info["base_lin_vel"]) ** 2))
         angular = float(np.sum(np.asarray(info["base_ang_vel"]) ** 2))
-        still = float(np.exp(-linear / .04 - angular / .25))
-        # Below standing there is a persistent deficit, rather than a positive
-        # head-height income that can be collected from a seated support trap.
+        # Smooth, bounded influence of velocity at all orientations, including
+        # upside-down. Extra settling pressure increases continuously with height.
+        still = float(np.exp(-linear / .09 - angular / .64))
+        clearance = float(np.exp(-3. * min(nonfoot, 10.)))
         rates = {
             "height_deficit": -2. * (1. - height),
-            "upright_deficit": -.5 * (1. - upright),
-            "support_deficit": -near_stand * ((1. - support) + min(nonfoot, 1.)),
-            "standing": 6. * near_stand * support * load * np.exp(-10. * nonfoot) * still,
-            "stable": 4. * float(is_recovered(info)),
-            "lin_vel": -near_stand * min(linear, 4.),
-            "ang_vel": -.2 * near_stand * min(angular, 25.),
-            "feet_slide": -.5 * near_stand * min(float(info["foot_slip"]), 2.),
-            "action_rate": -.005 * float(np.mean((command - last) ** 2)),
+            "upright_deficit": -(1. - upright),
+            "support_deficit": -.5 * height ** 2 * ((1. - load) + min(nonfoot, 2.)),
+            # Dense standing quality does not require near-zero speed first.
+            "standing": 4. * height ** 3 * (.25 + .75 * load) * clearance,
+            "stillness": 2. * height ** 3 * load * clearance * still,
+            "stable": 2. * float(is_recovered(info)),
+            # Near full height the default stance is rewarded: arms down,
+            # waist straight, feet at the nominal width. Gated by height^3 so
+            # limbs stay free while getting up.
+            "posture": 2. * height ** 3 * self.posture(info),
+            "feet_distance": -1.5 * height ** 3 * min(abs(float(info["feet_distance"]) - STAND_FEET_DISTANCE), .5),
+            "lin_vel": -.05 * (np.sqrt(1. + linear) - 1.) - .5 * height ** 2 * min(linear, 9.),
+            "ang_vel": -.02 * (np.sqrt(1. + angular) - 1.) - .1 * height ** 2 * min(angular, 36.),
+            "feet_slide": -.2 * (.1 + height ** 2) * min(float(info["foot_slip"]), 3.),
+            "action_rate": -.01 * float(np.mean((command - last) ** 2)),
             "energy": -.00002 * float(np.linalg.norm(np.asarray(info["torque"]) * info["joint_velocity"])),
             "dof_limit": -.5 * float(np.sum(info["joint_limit_excess"])),
         }

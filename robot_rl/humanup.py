@@ -126,30 +126,37 @@ class DiscoveryPoseCurriculum:
 
 
 class GetupCurriculum:
-    """Success-driven assistance withdrawal; no elapsed-step difficulty ramp."""
+    """Assistance withdrawal driven by a reachable milestone.
+
+    Advancement uses ``reached``: the robot stood upright without assistance
+    for one second at some point in the episode. The strict 2 s + 3 s hold in
+    ``is_success`` stays the evaluation and reward criterion; under PPO
+    exploration noise it is almost never met, so gating the curriculum on it
+    froze assistance at the first level for the whole run.
+    Prone and random starts are mixed in from the beginning.
+    """
+    POSES = ("stand", "supine", "prone", "random")
+    WEIGHTS = (.1, .35, .3, .25)
+
     def __init__(self):
         self.level = 0
-        self.outcomes = deque(maxlen=16)
-        self.prone_probability = 0.
+        self.outcomes = deque(maxlen=64)
+        self.prone_probability = self.WEIGHTS[2]
 
     @property
     def assistance(self):
         return (.6, .4, .2, 0.)[self.level]
 
-    def update(self, pose, success):
-        if pose not in ("supine", "prone"):
+    def update(self, pose, reached):
+        if pose not in ("supine", "prone", "random"):
             return
-        self.outcomes.append(bool(success))
-        if len(self.outcomes) >= 8 and np.mean(self.outcomes) >= .75:
-            if self.level < 3:
-                self.level += 1
-            else:
-                self.prone_probability = min(.4, self.prone_probability + .1)
+        self.outcomes.append(bool(reached))
+        if self.level < 3 and len(self.outcomes) >= 32 and np.mean(self.outcomes) >= .7:
+            self.level += 1
             self.outcomes.clear()
 
     def sample(self, rng):
-        return str(rng.choice(("stand", "supine", "prone"),
-                             p=(.3, .7 - self.prone_probability, self.prone_probability)))
+        return str(rng.choice(self.POSES, p=self.WEIGHTS))
 
 
 class DiscoveryTrajectory:

@@ -95,10 +95,15 @@ def test_rejected_update_restores_actor_critic_and_optimizer():
         for key, value in model.policy.optimizer.state_dict()["state"].items():
             for field, tensor in value.items():
                 torch.testing.assert_close(tensor, expected[key][field], rtol=0, atol=0)
-        assert model.adaptive_learning_rate == pytest.approx(2e-4 / 1.5)
+        assert model.adaptive_learning_rate == pytest.approx(1e-4)
         assert model.rejected_updates == 1
-        assert model.learning_rate_ceiling == pytest.approx(2e-4 / 1.5)
+        assert model.learning_rate_ceiling == pytest.approx(2e-4)
         assert not model._validate_update(reference, .008)
+        # A moderate overshoot (2-4x desired) is no longer rolled back, and the
+        # ceiling recovers after a few accepted updates.
+        assert not model._validate_update(reference, .02)
+        model._validate_update(reference, .008)
+        assert model.learning_rate_ceiling > 2e-4
     finally:
         env.close()
 

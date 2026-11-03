@@ -108,6 +108,9 @@ METRIC_NAMES = {
     "reward/support_deficit": "奖励/支撑差距",
     "reward/progress": "奖励/恢复进展",
     "reward/stable": "奖励/静止站稳",
+    "reward/stillness": "奖励/静止质量",
+    "reward/posture": "奖励/站姿",
+    "curriculum/reached_upright": "课程/站起比例",
     "curriculum/assist_fraction": "课程/当前辅助体重比",
     "curriculum/assistance_level": "课程/撤除辅助级别",
     "reward/assist": "诊断/拉力",
@@ -190,6 +193,7 @@ def train(
     load: Path | None = None,
     humanup_stage: str = "discovery",
     reference: Path | None = None,
+    workers: int | None = None,
 ) -> PPO:
     import torch
 
@@ -212,7 +216,9 @@ def train(
     batch_size = max(2, steps * n_envs // 4) if humanup else min(BATCH_SIZE, steps * n_envs)
     ent_coef = .001 if humanup else 0.
     learning_rate = 2e-4 if humanup else LEARNING_RATE
-    target_kl = DESIRED_KL if humanup else TARGET_KL
+    # SB3 stops an epoch at 1.5 * target_kl; HumanUPPPO rolls back above
+    # REJECT_KL_FACTOR * desired_kl. Stopping must come first.
+    target_kl = 2. * DESIRED_KL if humanup else TARGET_KL
     epochs = 5 if humanup else N_EPOCHS
     algorithm = HumanUPPPO if humanup else PPO
     # Validate before spawning hundreds of environments. Different observations
@@ -231,7 +237,7 @@ def train(
                 raise ValueError("检查点的动作分布/奖励契约不兼容，不能直接续训。请从头训练；旧日志和权重保留。")
         finally:
             probe.close()
-    workers = 1 if n_envs == 1 else worker_count(n_envs)
+    workers = 1 if n_envs == 1 else (worker_count(n_envs) if workers is None else max(1, min(int(workers), n_envs)))
     print(
         f"并行 {n_envs} 个人形，{workers} 个进程各自串行推动，batch {batch_size}，"
         f"单轮 KL 超过 {1.5 * target_kl:g} 就停下，device {device}。"
@@ -251,6 +257,7 @@ def train(
         model = algorithm(
             RecoveryPolicy if humanup else "MlpPolicy",
             vec,
+            **({"desired_kl": DESIRED_KL} if humanup else {}),
             learning_rate=learning_rate,
             n_steps=steps,
             batch_size=batch_size,
@@ -288,6 +295,9 @@ def train(
             target_kl=target_kl,
         )
         already = int(model.num_timesteps)
+        if humanup and isinstance(model, HumanUPPPO):
+            model.desired_kl = DESIRED_KL
+            model.reset_learning_rate(learning_rate)
         print(f"从 {load} 续训，已有 {already} 步。熵系数按本课程设为 {ent_coef}。")
     model.ent_coef = ent_coef
     if humanup:
@@ -296,7 +306,7 @@ def train(
         model.humanup_action_scale = action_scale.tolist()
         model.humanup_action_scale_low = action_scale_low.tolist()
         model.humanup_action_scale_high = action_scale_high.tolist()
-        model.getup_reward = "recovery-deficit-assistance" if humanup_stage == "discovery" else "humanup-refinement"
+        model.getup_reward = "recovery-posture-reach" if humanup_stage == "discovery" else "humanup-refinement"
         model.humanup_stage = humanup_stage
         model.humanup_reference = env_kwargs["reference_path"]
     model._stats_window_size = SUCCESS_WINDOW
@@ -598,6 +608,8 @@ class _RewardCurves(BaseCallback):
         self._counts = 0
         self._sums: dict[str, float] = {}
         self._diagnostics: dict[str, float] = {}
+        self._reached = 0.
+        self._episodes = 0
 
     def _on_training_start(self) -> None:
         # SwanLab 会在自己的 _on_training_start 里换掉 logger。这里排在它后面，包的是新 logger。
@@ -617,6 +629,9 @@ class _RewardCurves(BaseCallback):
             for name in ("assist_fraction", "assistance_level"):
                 if name in info:
                     metrics[f"curriculum/{name}"] = info[name]
+            if info.get("episode") is not None and "reached_upright" in info:
+                self._reached += float(info["reached_upright"])
+                self._episodes += 1
             if "prone_probability" in info:
                 metrics["curriculum/prone_fraction"] = info["prone_probability"]
             if "regularization_strength" in info:
@@ -634,6 +649,10 @@ class _RewardCurves(BaseCallback):
             self.model.logger.record(f"reward/{key}", total / self._counts)
         for key, total in self._diagnostics.items():
             self.model.logger.record(key, total / self._counts)
+        if self._episodes:
+            self.model.logger.record("curriculum/reached_upright", self._reached / self._episodes)
+        self._reached = 0.
+        self._episodes = 0
         self._vec_steps = 0
         self._counts = 0
         self._sums.clear()
@@ -656,6 +675,8 @@ def main() -> None:
     parser.add_argument("--stage", choices=("discovery", "refinement"), default="discovery")
     parser.add_argument("--reference", type=Path, default=None, help="第二阶段使用本机器人成功轨迹导出的 npz")
     parser.add_argument("--load", type=Path, default=None, help="从该检查点续训。--timesteps 仍是总步数，只补差额。")
+    parser.add_argument("--workers", type=int, default=None, help="采样进程数，默认按 CPU 核数。用 tools/tune_parallel.py 测最优值。")
+    parser.add_argument("--n-steps", type=int, default=None, help="每个环境每轮采样步数，getup 默认 24。")
     args = parser.parse_args()
     save_path = args.save
     print(
@@ -672,6 +693,8 @@ def main() -> None:
         load=args.load,
         humanup_stage=args.stage,
         reference=args.reference,
+        workers=args.workers,
+        n_steps=args.n_steps,
     )
 
 

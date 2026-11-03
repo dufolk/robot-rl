@@ -28,6 +28,11 @@ from robot_rl.humanup import ObservationHistory, DiscoveryTrajectory, DiscoveryP
 from robot_rl.recovery import RecoveryGoal
 from robot_rl.strikes import Strike, StrikeSchedule, impact_ray
 
+# Curriculum milestone: one unassisted second upright. Assistance stops after
+# the first eight seconds of an episode.
+REACH_STEPS = 50
+ASSIST_STEPS = 8 * 50
+
 
 class HumanoidBalanceEnv(gym.Env):
     metadata = {"render_modes": ["rgb_array"], "render_fps": 50}
@@ -136,6 +141,8 @@ class HumanoidBalanceEnv(gym.Env):
             return observation, info
         self._keep_state = False
         self._recovery.reset()
+        self._upright_steps = 0
+        self._reached = False
         self._was_hit = False
         self._knocked_down = False
         self._stable_steps = 0
@@ -179,11 +186,19 @@ class HumanoidBalanceEnv(gym.Env):
         if self._human_recovery and self.humanup_stage == "discovery":
             # Taper to zero before standing. Final five seconds are always
             # unassisted, and explicitly requested test poses never get help.
-            height = float(self.sim.data.xpos[self.sim.pelvis_id, 2])
-            fade = float(np.clip((.75 * self._stand_base_height - height) / (.6 * self._stand_base_height), 0., 1.))
+            # A raised pelvis in an inverted pose is not progress. Assistance
+            # withdrawal depends on both head clearance and signed orientation.
+            base = float(self.sim.data.xpos[self.sim.pelvis_id, 2]) / self._stand_base_height
+            head = float(self.sim.data.geom_xpos[self._head_id, 2]) / self._stand_head_height
+            up = min(float(self.sim.data.xmat[self.sim.pelvis_id].reshape(3, 3)[2, 2]),
+                     float(self.sim.data.geom_xmat[self.sim.chest_geom_id].reshape(3, 3)[2, 2]))
+            quality = min(base, head) * max(up, 0.)
+            fade = float(np.clip((.85 - quality) / .7, 0., 1.))
+            # Assistance only during the first ASSIST_SECONDS of an episode, so
+            # the policy never learns to rely on the pelvis lift to balance.
             allowed = (self.curriculum.name == "getup" and not self._explicit_pose
                        and self.sim.pose != "stand" and self.max_episode_steps is not None
-                       and self._steps < self.max_episode_steps - 250)
+                       and self._steps < min(self.max_episode_steps - 250, ASSIST_STEPS))
             self.assist_fraction = self._pose_curriculum.assistance * fade if allowed else 0.
         self.sim.set_assist(self._assist_n, upright_only=not isinstance(self._reward, GetupReward))
         self.sim.apply_action(np.asarray(action, dtype=np.float64))
@@ -235,10 +250,16 @@ class HumanoidBalanceEnv(gym.Env):
             self._update_impact(info)
         elif self._human_recovery and not terminated:
             self._recovery.update(info, eligible=self._assist_n == 0.)
+            upright = (self._assist_n == 0. and float(info["base_height"]) >= .8
+                       and min(float(info["upright"]), float(info["chest_upright"])) >= .9
+                       and not np.any(np.asarray(info["floor_n"])[2:] > 1.))
+            self._upright_steps = self._upright_steps + 1 if upright else 0
+            self._reached = self._reached or self._upright_steps >= REACH_STEPS
         if self._human_recovery:
             info["recovery_stage"] = self._recovery.stage
             info["recovery_stable_steps"] = self._recovery.stable_steps
             info["is_recovered"] = self._recovery.complete
+            info["reached_upright"] = self._reached
             if timed_out and not terminated:
                 # A fixed collection horizon is a timeout, not an absorbing
                 # failure. SB3 must bootstrap V(terminal_observation), as in
@@ -262,7 +283,7 @@ class HumanoidBalanceEnv(gym.Env):
             if terminated or truncated:
                 self._reward.end_episode(info["base_height"], info["stand_base_height"])
                 if not self._explicit_pose and self.curriculum.name == "getup" and self.humanup_stage == "discovery":
-                    self._pose_curriculum.update(self.sim.pose, info.get("is_success", False))
+                    self._pose_curriculum.update(self.sim.pose, self._reached)
         return observation, reward, terminated, truncated, info
 
     def fire_projectile(self, origin, direction, speed: float | None = None) -> bool:

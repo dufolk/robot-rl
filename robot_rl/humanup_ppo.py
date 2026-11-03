@@ -12,6 +12,12 @@ import torch
 from stable_baselines3 import PPO
 
 DESIRED_KL = .008
+# Whole updates are rolled back only when KL is far past the target. With the
+# former 2x threshold and a collapsed action std, nearly every update was
+# rejected and the learning-rate ceiling ratcheted down to its 1e-5 floor.
+REJECT_KL_FACTOR = 4.
+LR_FLOOR = 1e-5
+LR_CEILING = 1e-2
 
 
 def adaptive_rate(rate, kl, desired=DESIRED_KL):
@@ -55,23 +61,29 @@ class HumanUPPPO(PPO):
         return total / len(observations)
 
     def _validate_update(self, reference, kl):
-        rejected = not np.isfinite(kl) or kl > 2. * self.desired_kl
+        rejected = not np.isfinite(kl) or kl > REJECT_KL_FACTOR * self.desired_kl
         if rejected:
             self.policy.load_state_dict(reference.state_dict())
             self.policy.optimizer.load_state_dict(reference.optimizer.state_dict())
-            self.adaptive_learning_rate = max(1e-5, self.adaptive_learning_rate / 1.5)
-            # Keep the backoff across minibatches. Otherwise the upstream
-            # small-KL growth immediately undoes it on the next rollout.
-            self.learning_rate_ceiling = min(self.learning_rate_ceiling, self.adaptive_learning_rate)
+            self.adaptive_learning_rate = max(LR_FLOOR, self.adaptive_learning_rate / 2.)
+            # Temporary backoff: the ceiling recovers after a few accepted
+            # updates instead of staying pinned at the floor.
+            self.learning_rate_ceiling = max(LR_FLOOR, min(self.learning_rate_ceiling, 2. * self.adaptive_learning_rate))
             self._accepted_streak = 0
             self.rejected_updates += 1
             self._set_adaptive_rate()
         else:
             self._accepted_streak += 1
-            if self._accepted_streak >= 10:
-                self.learning_rate_ceiling = min(1e-2, self.learning_rate_ceiling * 1.1)
+            if self._accepted_streak >= 3:
+                self.learning_rate_ceiling = min(LR_CEILING, self.learning_rate_ceiling * 1.5)
                 self._accepted_streak = 0
         return rejected
+
+    def reset_learning_rate(self, rate):
+        """Fresh adaptive state, used when resuming an old checkpoint."""
+        self.adaptive_learning_rate = float(rate)
+        self.learning_rate_ceiling = LR_CEILING
+        self._accepted_streak = 0
 
     def train(self):
         update_started = perf_counter()
