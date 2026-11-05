@@ -11,13 +11,15 @@ import numpy as np
 import torch
 from stable_baselines3 import PPO
 
-DESIRED_KL = .008
-# Whole updates are rolled back only when KL is far past the target. With the
-# former 2x threshold and a collapsed action std, nearly every update was
-# rejected and the learning-rate ceiling ratcheted down to its 1e-5 floor.
-REJECT_KL_FACTOR = 4.
+# Paper uses .008. Slightly looser so one minibatch can stick under forward-edit;
+# fully open (None / ~2) previously collapsed action std.
+DESIRED_KL = .02
+# None disables whole-update rollback. Early-stop still limits how far one
+# update can go; rejecting after that undoes the only progress we get.
+REJECT_KL_FACTOR = None
 LR_FLOOR = 1e-5
 LR_CEILING = 1e-2
+VALUE_CLIP = .2
 
 
 def adaptive_rate(rate, kl, desired=DESIRED_KL):
@@ -61,13 +63,22 @@ class HumanUPPPO(PPO):
         return total / len(observations)
 
     def _validate_update(self, reference, kl):
+        if REJECT_KL_FACTOR is None:
+            # Still shrink LR on non-finite KL; never restore weights.
+            if not np.isfinite(kl):
+                self.adaptive_learning_rate = max(LR_FLOOR, self.adaptive_learning_rate / 2.)
+                self._set_adaptive_rate()
+            else:
+                self._accepted_streak += 1
+                if self._accepted_streak >= 3:
+                    self.learning_rate_ceiling = min(LR_CEILING, self.learning_rate_ceiling * 1.5)
+                    self._accepted_streak = 0
+            return False
         rejected = not np.isfinite(kl) or kl > REJECT_KL_FACTOR * self.desired_kl
         if rejected:
             self.policy.load_state_dict(reference.state_dict())
             self.policy.optimizer.load_state_dict(reference.optimizer.state_dict())
             self.adaptive_learning_rate = max(LR_FLOOR, self.adaptive_learning_rate / 2.)
-            # Temporary backoff: the ceiling recovers after a few accepted
-            # updates instead of staying pinned at the floor.
             self.learning_rate_ceiling = max(LR_FLOOR, min(self.learning_rate_ceiling, 2. * self.adaptive_learning_rate))
             self._accepted_streak = 0
             self.rejected_updates += 1

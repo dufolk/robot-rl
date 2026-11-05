@@ -135,6 +135,12 @@ class GetupReward(StandReward):
         # upside-down. Extra settling pressure increases continuously with height.
         still = float(np.exp(-linear / .09 - angular / .64))
         clearance = float(np.exp(-3. * min(nonfoot, 10.)))
+        slip = min(float(info["foot_slip"]), 3.)
+        planar = float(np.sum(np.asarray(info["base_lin_vel"])[:2] ** 2))
+        joint_speed = float(np.mean(np.asarray(info["joint_velocity"]) ** 2))
+        # Standing only counts as stable when the feet are planted; dithering
+        # feet that slide across the floor must not collect the stable bonus.
+        planted = float(np.exp(-slip / .15))
         rates = {
             "height_deficit": -2. * (1. - height),
             "upright_deficit": -(1. - upright),
@@ -142,16 +148,20 @@ class GetupReward(StandReward):
             # Dense standing quality does not require near-zero speed first.
             "standing": 4. * height ** 3 * (.25 + .75 * load) * clearance,
             "stillness": 2. * height ** 3 * load * clearance * still,
-            "stable": 2. * float(is_recovered(info)),
+            "stable": 2. * float(is_recovered(info)) * planted,
             # Near full height the default stance is rewarded: arms down,
             # waist straight, feet at the nominal width. Gated by height^3 so
             # limbs stay free while getting up.
             "posture": 2. * height ** 3 * self.posture(info),
             "feet_distance": -1.5 * height ** 3 * min(abs(float(info["feet_distance"]) - STAND_FEET_DISTANCE), .5),
-            "lin_vel": -.05 * (np.sqrt(1. + linear) - 1.) - .5 * height ** 2 * min(linear, 9.),
+            "lin_vel": -.05 * (np.sqrt(1. + linear) - 1.) - .5 * height ** 2 * min(linear, 9.)
+                       - 4. * height ** 3 * min(planar, 1.),
             "ang_vel": -.02 * (np.sqrt(1. + angular) - 1.) - .1 * height ** 2 * min(angular, 36.),
-            "feet_slide": -.2 * (.1 + height ** 2) * min(float(info["foot_slip"]), 3.),
-            "action_rate": -.01 * float(np.mean((command - last) ** 2)),
+            # Height-gated: limbs move freely while getting up, but once tall
+            # the feet must stay planted and the commands must stay smooth.
+            "feet_slide": -(.02 + 2. * height ** 3) * slip,
+            "action_rate": -(.05 + 3. * height ** 3) * float(np.mean((command - last) ** 2)),
+            "dof_vel": -.02 * height ** 3 * min(joint_speed, 100.),
             "energy": -.00002 * float(np.linalg.norm(np.asarray(info["torque"]) * info["joint_velocity"])),
             "dof_limit": -.5 * float(np.sum(info["joint_limit_excess"])),
         }

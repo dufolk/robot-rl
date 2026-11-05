@@ -65,20 +65,24 @@ def test_pose_difficulty_requires_actual_supine_success():
 
 
 def test_adaptive_learning_rate_thresholds_and_bounds():
-    assert adaptive_rate(2e-4, .02) == pytest.approx(2e-4 / 1.5)
-    assert adaptive_rate(2e-4, .002) == pytest.approx(3e-4)
-    assert adaptive_rate(2e-4, .008) == 2e-4
-    assert adaptive_rate(2e-4, 0.) == 2e-4
-    assert adaptive_rate(1e-5, 1.) == 1e-5
-    assert adaptive_rate(1e-2, .001) == 1e-2
+    d = .008
+    assert adaptive_rate(2e-4, .02, d) == pytest.approx(2e-4 / 1.5)
+    assert adaptive_rate(2e-4, .002, d) == pytest.approx(3e-4)
+    assert adaptive_rate(2e-4, .008, d) == 2e-4
+    assert adaptive_rate(2e-4, 0., d) == 2e-4
+    assert adaptive_rate(1e-5, 1., d) == 1e-5
+    assert adaptive_rate(1e-2, .001, d) == 1e-2
 
 
-def test_rejected_update_restores_actor_critic_and_optimizer():
+def test_rejected_update_restores_actor_critic_and_optimizer(monkeypatch):
+    import robot_rl.humanup_ppo as humanup_ppo
+    monkeypatch.setattr(humanup_ppo, "REJECT_KL_FACTOR", 4.)
     torch.set_num_threads(1)
     env = HumanoidBalanceEnv(curriculum="stand")
     try:
         model = HumanUPPPO("MlpPolicy", env, n_steps=8, batch_size=8,
                            policy_kwargs={"net_arch": [16]}, device="cpu", learning_rate=2e-4)
+        model.desired_kl = .008
         # Give Adam a nonempty state before taking the transaction snapshot.
         loss = sum(p.square().sum() for p in model.policy.parameters())
         loss.backward()

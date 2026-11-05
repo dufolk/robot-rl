@@ -25,6 +25,7 @@ import swanlab
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.utils import get_schedule_fn
 from stable_baselines3.common.vec_env import DummyVecEnv
 from swanlab.integration.sb3 import SwanLabCallback
 
@@ -32,7 +33,8 @@ from robot_rl.curriculum import CURRICULA, SUCCESS_RATE, SUCCESS_WINDOW, get_cur
 from robot_rl.checkpoint import read_metadata
 from robot_rl.env import HumanoidBalanceEnv
 from robot_rl.humanup import MODEL_CONTRACT, initial_action_std, exploration_scale
-from robot_rl.humanup_ppo import HumanUPPPO, DESIRED_KL
+from robot_rl.forward_edit import has_forward_edit
+from robot_rl.humanup_ppo import HumanUPPPO, DESIRED_KL, VALUE_CLIP
 from robot_rl.humanup_policy import RecoveryPolicy
 from robot_rl.vec import N_ENVS, ShardedVecEnv, worker_count
 
@@ -216,8 +218,8 @@ def train(
     batch_size = max(2, steps * n_envs // 4) if humanup else min(BATCH_SIZE, steps * n_envs)
     ent_coef = .001 if humanup else 0.
     learning_rate = 2e-4 if humanup else LEARNING_RATE
-    # SB3 stops an epoch at 1.5 * target_kl; HumanUPPPO rolls back above
-    # REJECT_KL_FACTOR * desired_kl. Stopping must come first.
+    # SB3 early-stops at 1.5 * target_kl. Slightly above paper (.008) so each
+    # rollout can keep one small step; keep whole-update reject off.
     target_kl = 2. * DESIRED_KL if humanup else TARGET_KL
     epochs = 5 if humanup else N_EPOCHS
     algorithm = HumanUPPPO if humanup else PPO
@@ -268,7 +270,7 @@ def train(
             clip_range=0.2,
             ent_coef=ent_coef,
             vf_coef=1. if humanup else .5,
-            clip_range_vf=.2 if humanup else None,
+            clip_range_vf=VALUE_CLIP if humanup else None,
             max_grad_norm=1. if humanup else .5,
             seed=seed,
             device=device,
@@ -297,10 +299,18 @@ def train(
         already = int(model.num_timesteps)
         if humanup and isinstance(model, HumanUPPPO):
             model.desired_kl = DESIRED_KL
+            model.target_kl = target_kl
             model.reset_learning_rate(learning_rate)
+            # Keep original standing-gate weights; do not soften or freeze them.
+            if has_forward_edit(load):
+                print("检测到 forward-edit 门控，保留原参数；整轮回滚已关闭。")
         print(f"从 {load} 续训，已有 {already} 步。熵系数按本课程设为 {ent_coef}。")
     model.ent_coef = ent_coef
     if humanup:
+        # load() may restore an older clip_range_vf / target_kl; force current settings.
+        model.clip_range_vf = get_schedule_fn(VALUE_CLIP)
+        model.target_kl = target_kl
+        model.desired_kl = DESIRED_KL
         model.policy.log_std.requires_grad_(True)
         model.humanup_contract = MODEL_CONTRACT
         model.humanup_action_scale = action_scale.tolist()
